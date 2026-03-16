@@ -3,15 +3,14 @@
 Servidor MCP - Sistema de Memoria Persistente para Claude Code
 ==============================================================
 Almacena tickets, notas, historial de trabajo y contexto de proyectos
-en una base de datos SQLite local.
+en una base de datos SQLite local. Diseñado para ser reutilizado en
+cualquier equipo y cualquier proyecto.
 
-Autor: Luis (srv-testx)
-Fecha: 2026-03-16
+Repositorio: https://github.com/GeorgePC01/mcp-memoria-sence
+Version: 2.0.0
 """
 
 import sqlite3
-import json
-import os
 from datetime import datetime
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -21,8 +20,12 @@ DB_PATH = Path(__file__).parent / "memoria.db"
 
 # ── Inicializar servidor MCP ───────────────────────────────────────────────
 mcp = FastMCP(
-    "memoria-sence",
-    instructions="Sistema de memoria persistente para proyectos SENCE y Moodle CAF. Version 1.0.0"
+    "claude-memory",
+    instructions=(
+        "Sistema de memoria persistente para Claude Code. "
+        "Almacena proyectos, tickets, notas, acciones y sesiones de trabajo "
+        "en SQLite local para mantener continuidad entre conversaciones. Version 2.0.0"
+    )
 )
 
 
@@ -161,6 +164,32 @@ def init_db():
     conn.close()
 
 
+# ── Funciones auxiliares ───────────────────────────────────────────────────
+def _resolver_proyecto_id(conn, proyecto: str):
+    """Busca proyecto_id por nombre. Retorna None si no se encuentra."""
+    if not proyecto:
+        return None
+    row = conn.execute("SELECT id FROM proyectos WHERE nombre LIKE ?", (f"%{proyecto}%",)).fetchone()
+    return row['id'] if row else None
+
+
+def _resolver_ticket_y_proyecto(conn, ticket_codigo: str, proyecto: str = ""):
+    """Resuelve ticket_id y proyecto_id a partir de codigo de ticket y/o nombre de proyecto."""
+    ticket_id = None
+    proyecto_id = None
+
+    if ticket_codigo:
+        row = conn.execute("SELECT id, proyecto_id FROM tickets WHERE codigo = ?", (ticket_codigo,)).fetchone()
+        if row:
+            ticket_id = row['id']
+            proyecto_id = row['proyecto_id']
+
+    if proyecto and not proyecto_id:
+        proyecto_id = _resolver_proyecto_id(conn, proyecto)
+
+    return ticket_id, proyecto_id
+
+
 # ── Herramientas MCP: PROYECTOS ───────────────────────────────────────────
 
 @mcp.tool()
@@ -168,9 +197,9 @@ def crear_proyecto(nombre: str, descripcion: str = "", ambiente: str = "") -> st
     """Crea un nuevo proyecto en la base de datos.
 
     Args:
-        nombre: Nombre del proyecto (ej: 'SENCE', 'Moodle CAF')
+        nombre: Nombre del proyecto (ej: 'MiApp', 'Backend API', 'Infraestructura')
         descripcion: Descripcion del proyecto
-        ambiente: Ambiente (PRD, DEV, QA, etc.)
+        ambiente: Ambiente (PRD, DEV, QA, STG, LOCAL, etc.)
     """
     conn = get_db()
     try:
@@ -188,15 +217,27 @@ def crear_proyecto(nombre: str, descripcion: str = "", ambiente: str = "") -> st
 
 @mcp.tool()
 def listar_proyectos() -> str:
-    """Lista todos los proyectos registrados."""
+    """Lista todos los proyectos registrados con sus estadisticas basicas."""
     conn = get_db()
     rows = conn.execute("SELECT * FROM proyectos ORDER BY nombre").fetchall()
-    conn.close()
     if not rows:
+        conn.close()
         return "No hay proyectos registrados."
     result = []
     for r in rows:
-        result.append(f"[{r['id']}] {r['nombre']} | {r['descripcion'] or '-'} | Amb: {r['ambiente'] or '-'} | Creado: {r['created_at']}")
+        tickets_abiertos = conn.execute(
+            "SELECT COUNT(*) FROM tickets WHERE proyecto_id=? AND estado IN ('ABIERTO','EN_PROCESO')",
+            (r['id'],)
+        ).fetchone()[0]
+        total_tickets = conn.execute(
+            "SELECT COUNT(*) FROM tickets WHERE proyecto_id=?", (r['id'],)
+        ).fetchone()[0]
+        result.append(
+            f"[{r['id']}] {r['nombre']} | {r['descripcion'] or '-'} | "
+            f"Amb: {r['ambiente'] or '-'} | Tickets: {tickets_abiertos} abiertos / {total_tickets} total | "
+            f"Creado: {r['created_at']}"
+        )
+    conn.close()
     return "\n".join(result)
 
 
@@ -219,20 +260,20 @@ def guardar_ticket(
     """Guarda o actualiza un ticket en la base de datos.
 
     Si el ticket ya existe (por codigo), lo actualiza.
-    Si no existe, lo crea.
+    Si no existe, lo crea. Si el proyecto no existe, lo crea automaticamente.
 
     Args:
-        codigo: Codigo del ticket (ej: 'R-010292')
+        codigo: Codigo unico del ticket (ej: 'BUG-001', 'TASK-042', 'INC-007')
         titulo: Titulo o asunto del ticket
-        descripcion: Descripcion detallada del ticket
-        proyecto: Nombre del proyecto asociado (ej: 'SENCE')
+        descripcion: Descripcion detallada del problema o tarea
+        proyecto: Nombre del proyecto asociado (se crea automaticamente si no existe)
         estado: Estado actual (ABIERTO, EN_PROCESO, RESUELTO, CERRADO)
         prioridad: Prioridad (BAJA, MEDIA, ALTA, CRITICA)
-        fecha_apertura: Fecha de apertura (YYYY-MM-DD)
-        causa_raiz: Causa raiz identificada
-        solucion: Solucion aplicada
-        notas: Notas adicionales
-        tags: Tags separados por coma
+        fecha_apertura: Fecha de apertura (YYYY-MM-DD). Si no se indica, usa la fecha actual
+        causa_raiz: Causa raiz identificada del problema
+        solucion: Solucion aplicada o propuesta
+        notas: Notas adicionales de contexto
+        tags: Tags separados por coma (ej: 'backend,urgente,mysql')
     """
     conn = get_db()
 
@@ -243,7 +284,6 @@ def guardar_ticket(
         if row:
             proyecto_id = row['id']
         else:
-            # Crear proyecto automaticamente
             conn.execute("INSERT INTO proyectos (nombre) VALUES (?)", (proyecto,))
             conn.commit()
             proyecto_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -252,7 +292,6 @@ def guardar_ticket(
     existing = conn.execute("SELECT id FROM tickets WHERE codigo = ?", (codigo,)).fetchone()
 
     if existing:
-        # Actualizar solo los campos no vacios
         updates = []
         params = []
         if titulo:
@@ -301,10 +340,10 @@ def guardar_ticket(
 
 @mcp.tool()
 def buscar_ticket(codigo: str) -> str:
-    """Busca un ticket por su codigo y retorna toda su informacion.
+    """Busca un ticket por su codigo y retorna toda su informacion incluyendo notas y acciones asociadas.
 
     Args:
-        codigo: Codigo del ticket (ej: 'R-010292')
+        codigo: Codigo del ticket (ej: 'BUG-001')
     """
     conn = get_db()
     row = conn.execute("""
@@ -318,12 +357,10 @@ def buscar_ticket(codigo: str) -> str:
         conn.close()
         return f"Ticket {codigo} no encontrado."
 
-    # Buscar notas asociadas
     notas = conn.execute(
         "SELECT * FROM notas WHERE ticket_id = ? ORDER BY fecha DESC", (row['id'],)
     ).fetchall()
 
-    # Buscar acciones asociadas
     acciones = conn.execute(
         "SELECT * FROM acciones WHERE ticket_id = ? ORDER BY fecha DESC", (row['id'],)
     ).fetchall()
@@ -331,23 +368,23 @@ def buscar_ticket(codigo: str) -> str:
     conn.close()
 
     result = [
-        f"═══ TICKET {row['codigo']} ═══",
+        f"=== TICKET {row['codigo']} ===",
         f"Titulo: {row['titulo']}",
         f"Proyecto: {row['proyecto_nombre'] or '-'}",
         f"Estado: {row['estado']} | Prioridad: {row['prioridad']}",
         f"Fecha apertura: {row['fecha_apertura'] or '-'}",
         f"Fecha cierre: {row['fecha_cierre'] or '-'}",
         f"",
-        f"── Descripcion ──",
+        f"-- Descripcion --",
         f"{row['descripcion'] or '(sin descripcion)'}",
         f"",
-        f"── Causa raiz ──",
+        f"-- Causa raiz --",
         f"{row['causa_raiz'] or '(no identificada)'}",
         f"",
-        f"── Solucion ──",
+        f"-- Solucion --",
         f"{row['solucion'] or '(pendiente)'}",
         f"",
-        f"── Notas ──",
+        f"-- Notas --",
         f"{row['notas'] or '(sin notas)'}",
         f"",
         f"Tags: {row['tags'] or '-'}",
@@ -355,12 +392,12 @@ def buscar_ticket(codigo: str) -> str:
     ]
 
     if notas:
-        result.append(f"\n── Historial de notas ({len(notas)}) ──")
+        result.append(f"\n-- Historial de notas ({len(notas)}) --")
         for n in notas:
             result.append(f"  [{n['fecha']}] ({n['tipo']}) {n['contenido']}")
 
     if acciones:
-        result.append(f"\n── Acciones registradas ({len(acciones)}) ──")
+        result.append(f"\n-- Acciones registradas ({len(acciones)}) --")
         for a in acciones:
             result.append(f"  [{a['fecha']}] {a['descripcion']}")
             if a['comando']:
@@ -373,18 +410,22 @@ def buscar_ticket(codigo: str) -> str:
 def listar_tickets(
     proyecto: str = "",
     estado: str = "",
+    prioridad: str = "",
+    tags: str = "",
     limite: int = 20
 ) -> str:
-    """Lista tickets filtrados por proyecto y/o estado.
+    """Lista tickets filtrados por proyecto, estado, prioridad o tags.
 
     Args:
         proyecto: Filtrar por nombre de proyecto
         estado: Filtrar por estado (ABIERTO, EN_PROCESO, RESUELTO, CERRADO)
+        prioridad: Filtrar por prioridad (BAJA, MEDIA, ALTA, CRITICA)
+        tags: Filtrar por tag (busca coincidencia parcial)
         limite: Numero maximo de resultados (default: 20)
     """
     conn = get_db()
     query = """
-        SELECT t.codigo, t.titulo, t.estado, t.prioridad, t.fecha_apertura,
+        SELECT t.codigo, t.titulo, t.estado, t.prioridad, t.fecha_apertura, t.tags,
                p.nombre as proyecto_nombre
         FROM tickets t
         LEFT JOIN proyectos p ON t.proyecto_id = p.id
@@ -398,6 +439,12 @@ def listar_tickets(
     if estado:
         query += " AND t.estado = ?"
         params.append(estado)
+    if prioridad:
+        query += " AND t.prioridad = ?"
+        params.append(prioridad)
+    if tags:
+        query += " AND t.tags LIKE ?"
+        params.append(f"%{tags}%")
 
     query += " ORDER BY t.updated_at DESC LIMIT ?"
     params.append(limite)
@@ -409,7 +456,7 @@ def listar_tickets(
         return "No se encontraron tickets con los filtros especificados."
 
     result = [f"{'Codigo':<12} {'Estado':<12} {'Prioridad':<10} {'Proyecto':<15} {'Titulo'}"]
-    result.append("─" * 80)
+    result.append("-" * 80)
     for r in rows:
         result.append(
             f"{r['codigo']:<12} {r['estado']:<12} {r['prioridad']:<10} "
@@ -450,6 +497,31 @@ def cerrar_ticket(codigo: str, solucion: str = "", causa_raiz: str = "") -> str:
     return f"Ticket {codigo} cerrado exitosamente."
 
 
+@mcp.tool()
+def eliminar_ticket(codigo: str) -> str:
+    """Elimina un ticket y todas sus notas y acciones asociadas. USAR CON PRECAUCION.
+
+    Args:
+        codigo: Codigo del ticket a eliminar
+    """
+    conn = get_db()
+    row = conn.execute("SELECT id FROM tickets WHERE codigo = ?", (codigo,)).fetchone()
+    if not row:
+        conn.close()
+        return f"Ticket {codigo} no encontrado."
+
+    ticket_id = row['id']
+    notas_del = conn.execute("DELETE FROM notas WHERE ticket_id = ?", (ticket_id,)).rowcount
+    acciones_del = conn.execute("DELETE FROM acciones WHERE ticket_id = ?", (ticket_id,)).rowcount
+    conn.execute("DELETE FROM tickets WHERE id = ?", (ticket_id,))
+    conn.commit()
+    conn.close()
+    return (
+        f"Ticket {codigo} eliminado. "
+        f"Se eliminaron tambien {notas_del} nota(s) y {acciones_del} accion(es) asociadas."
+    )
+
+
 # ── Herramientas MCP: NOTAS ───────────────────────────────────────────────
 
 @mcp.tool()
@@ -464,29 +536,15 @@ def agregar_nota(
     """Agrega una nota al historial. Puede estar asociada a un ticket y/o proyecto.
 
     Args:
-        contenido: Contenido de la nota
+        contenido: Contenido de la nota (ser descriptivo y detallado)
         ticket_codigo: Codigo del ticket asociado (opcional)
         proyecto: Nombre del proyecto asociado (opcional)
         tipo: Tipo de nota (NOTA, DIAGNOSTICO, SOLUCION, OBSERVACION, DECISION, PENDIENTE)
-        ambiente: Ambiente (PRD, DEV, etc.)
+        ambiente: Ambiente donde aplica (PRD, DEV, QA, STG, LOCAL)
         tags: Tags separados por coma
     """
     conn = get_db()
-
-    ticket_id = None
-    proyecto_id = None
-
-    if ticket_codigo:
-        row = conn.execute("SELECT id, proyecto_id FROM tickets WHERE codigo = ?", (ticket_codigo,)).fetchone()
-        if row:
-            ticket_id = row['id']
-            if not proyecto_id:
-                proyecto_id = row['proyecto_id']
-
-    if proyecto and not proyecto_id:
-        row = conn.execute("SELECT id FROM proyectos WHERE nombre LIKE ?", (f"%{proyecto}%",)).fetchone()
-        if row:
-            proyecto_id = row['id']
+    ticket_id, proyecto_id = _resolver_ticket_y_proyecto(conn, ticket_codigo, proyecto)
 
     conn.execute(
         """INSERT INTO notas (ticket_id, proyecto_id, tipo, contenido, ambiente, tags)
@@ -581,30 +639,17 @@ def registrar_accion(
     """Registra una accion o comando ejecutado en el historial.
 
     Args:
-        descripcion: Descripcion de la accion
+        descripcion: Descripcion clara de la accion realizada
         ticket_codigo: Codigo del ticket asociado
         proyecto: Nombre del proyecto
-        tipo: Tipo (COMANDO, DEPLOY, BACKUP, ROLLBACK, CONFIG, INVESTIGACION)
-        comando: Comando ejecutado
-        resultado: Resultado obtenido
-        ambiente: Ambiente (PRD, DEV)
-        servidor: Servidor donde se ejecuto
+        tipo: Tipo (COMANDO, DEPLOY, BACKUP, ROLLBACK, CONFIG, INVESTIGACION, MIGRACION, TEST)
+        comando: Comando ejecutado (copiar textual)
+        resultado: Resultado obtenido (exito, error, output relevante)
+        ambiente: Ambiente (PRD, DEV, QA, STG, LOCAL)
+        servidor: Servidor o host donde se ejecuto
     """
     conn = get_db()
-
-    ticket_id = None
-    proyecto_id = None
-
-    if ticket_codigo:
-        row = conn.execute("SELECT id, proyecto_id FROM tickets WHERE codigo = ?", (ticket_codigo,)).fetchone()
-        if row:
-            ticket_id = row['id']
-            proyecto_id = row['proyecto_id']
-
-    if proyecto and not proyecto_id:
-        row = conn.execute("SELECT id FROM proyectos WHERE nombre LIKE ?", (f"%{proyecto}%",)).fetchone()
-        if row:
-            proyecto_id = row['id']
+    ticket_id, proyecto_id = _resolver_ticket_y_proyecto(conn, ticket_codigo, proyecto)
 
     conn.execute(
         """INSERT INTO acciones (ticket_id, proyecto_id, tipo, descripcion, comando, resultado, ambiente, servidor)
@@ -616,21 +661,94 @@ def registrar_accion(
     return f"Accion registrada exitosamente."
 
 
+@mcp.tool()
+def listar_acciones(
+    proyecto: str = "",
+    ticket_codigo: str = "",
+    tipo: str = "",
+    ambiente: str = "",
+    limite: int = 20
+) -> str:
+    """Lista acciones registradas filtradas por proyecto, ticket, tipo o ambiente.
+
+    Args:
+        proyecto: Filtrar por nombre de proyecto
+        ticket_codigo: Filtrar por codigo de ticket
+        tipo: Filtrar por tipo (COMANDO, DEPLOY, BACKUP, ROLLBACK, CONFIG, INVESTIGACION, MIGRACION, TEST)
+        ambiente: Filtrar por ambiente (PRD, DEV, QA, STG, LOCAL)
+        limite: Numero maximo de resultados
+    """
+    conn = get_db()
+    query = """
+        SELECT a.*, t.codigo as ticket_codigo, p.nombre as proyecto_nombre
+        FROM acciones a
+        LEFT JOIN tickets t ON a.ticket_id = t.id
+        LEFT JOIN proyectos p ON a.proyecto_id = p.id
+        WHERE 1=1
+    """
+    params = []
+
+    if proyecto:
+        query += " AND p.nombre LIKE ?"
+        params.append(f"%{proyecto}%")
+    if ticket_codigo:
+        query += " AND t.codigo = ?"
+        params.append(ticket_codigo)
+    if tipo:
+        query += " AND a.tipo = ?"
+        params.append(tipo)
+    if ambiente:
+        query += " AND a.ambiente = ?"
+        params.append(ambiente)
+
+    query += " ORDER BY a.fecha DESC LIMIT ?"
+    params.append(limite)
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    if not rows:
+        return "No se encontraron acciones con los filtros especificados."
+
+    result = []
+    for r in rows:
+        header = f"[{r['fecha']}] ({r['tipo']})"
+        if r['ticket_codigo']:
+            header += f" #{r['ticket_codigo']}"
+        if r['proyecto_nombre']:
+            header += f" @{r['proyecto_nombre']}"
+        if r['ambiente']:
+            header += f" [{r['ambiente']}]"
+        if r['servidor']:
+            header += f" srv:{r['servidor']}"
+        result.append(header)
+        result.append(f"  {r['descripcion']}")
+        if r['comando']:
+            result.append(f"  CMD: {r['comando']}")
+        if r['resultado']:
+            result.append(f"  RES: {r['resultado'][:200]}")
+        result.append("")
+
+    return "\n".join(result)
+
+
 # ── Herramientas MCP: SESIONES ─────────────────────────────────────────────
 
 @mcp.tool()
 def iniciar_sesion(proyecto: str, resumen: str) -> str:
-    """Registra el inicio de una sesion de trabajo.
+    """Registra el inicio de una sesion de trabajo. LLAMAR SIEMPRE al comenzar a trabajar.
 
     Args:
-        proyecto: Nombre del proyecto
-        resumen: Resumen de lo que se va a trabajar
+        proyecto: Nombre del proyecto (se crea automaticamente si no existe)
+        resumen: Resumen de lo que se va a trabajar en esta sesion
     """
     conn = get_db()
-    proyecto_id = None
-    row = conn.execute("SELECT id FROM proyectos WHERE nombre LIKE ?", (f"%{proyecto}%",)).fetchone()
-    if row:
-        proyecto_id = row['id']
+    proyecto_id = _resolver_proyecto_id(conn, proyecto)
+
+    if not proyecto_id and proyecto:
+        conn.execute("INSERT INTO proyectos (nombre) VALUES (?)", (proyecto,))
+        conn.commit()
+        proyecto_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     conn.execute(
         "INSERT INTO sesiones (proyecto_id, resumen) VALUES (?, ?)",
@@ -645,13 +763,19 @@ def iniciar_sesion(proyecto: str, resumen: str) -> str:
 @mcp.tool()
 def cerrar_sesion(sesion_id: int, trabajo_realizado: str, pendientes: str = "") -> str:
     """Cierra una sesion de trabajo registrando lo realizado y pendientes.
+    LLAMAR SIEMPRE al terminar de trabajar.
 
     Args:
-        sesion_id: ID de la sesion a cerrar
-        trabajo_realizado: Resumen del trabajo realizado
-        pendientes: Trabajo pendiente para proxima sesion
+        sesion_id: ID de la sesion a cerrar (proporcionado al iniciar_sesion)
+        trabajo_realizado: Resumen detallado del trabajo realizado en esta sesion
+        pendientes: Trabajo pendiente para la proxima sesion (ser especifico)
     """
     conn = get_db()
+    existing = conn.execute("SELECT id FROM sesiones WHERE id = ?", (sesion_id,)).fetchone()
+    if not existing:
+        conn.close()
+        return f"Sesion #{sesion_id} no encontrada."
+
     conn.execute(
         """UPDATE sesiones SET trabajo_realizado = ?, pendientes = ?,
            fecha_fin = datetime('now', 'localtime') WHERE id = ?""",
@@ -664,7 +788,7 @@ def cerrar_sesion(sesion_id: int, trabajo_realizado: str, pendientes: str = "") 
 
 @mcp.tool()
 def ver_ultima_sesion(proyecto: str = "") -> str:
-    """Muestra la ultima sesion de trabajo de un proyecto.
+    """Muestra la ultima sesion de trabajo. Util para retomar contexto al iniciar.
 
     Args:
         proyecto: Nombre del proyecto (opcional, muestra la mas reciente si no se especifica)
@@ -688,20 +812,145 @@ def ver_ultima_sesion(proyecto: str = "") -> str:
         return "No hay sesiones registradas."
 
     result = [
-        f"═══ SESION #{row['id']} ═══",
+        f"=== SESION #{row['id']} ===",
         f"Proyecto: {row['proyecto_nombre'] or '-'}",
         f"Inicio: {row['fecha_inicio']}",
         f"Fin: {row['fecha_fin'] or '(en curso)'}",
         f"",
-        f"── Resumen ──",
+        f"-- Resumen --",
         f"{row['resumen']}",
         f"",
-        f"── Trabajo realizado ──",
+        f"-- Trabajo realizado --",
         f"{row['trabajo_realizado'] or '(no registrado)'}",
         f"",
-        f"── Pendientes ──",
+        f"-- Pendientes --",
         f"{row['pendientes'] or '(ninguno)'}",
     ]
+    return "\n".join(result)
+
+
+# ── Herramientas MCP: CONTEXTO RAPIDO ─────────────────────────────────────
+
+@mcp.tool()
+def contexto_rapido(proyecto: str = "") -> str:
+    """Genera un resumen completo del estado actual para retomar trabajo rapidamente.
+    Incluye: ultima sesion, tickets abiertos, notas recientes y ultimas acciones.
+    USAR AL INICIO DE CADA CONVERSACION para obtener contexto inmediato.
+
+    Args:
+        proyecto: Nombre del proyecto (opcional, muestra todo si no se especifica)
+    """
+    conn = get_db()
+    result = []
+
+    # --- Ultima sesion ---
+    query_sesion = """
+        SELECT s.*, p.nombre as proyecto_nombre
+        FROM sesiones s LEFT JOIN proyectos p ON s.proyecto_id = p.id
+    """
+    params_sesion = []
+    if proyecto:
+        query_sesion += " WHERE p.nombre LIKE ?"
+        params_sesion.append(f"%{proyecto}%")
+    query_sesion += " ORDER BY s.fecha_inicio DESC LIMIT 1"
+    sesion = conn.execute(query_sesion, params_sesion).fetchone()
+
+    if sesion:
+        result.append("=== ULTIMA SESION ===")
+        result.append(f"Proyecto: {sesion['proyecto_nombre'] or '-'} | Inicio: {sesion['fecha_inicio']} | Fin: {sesion['fecha_fin'] or '(en curso)'}")
+        result.append(f"Resumen: {sesion['resumen']}")
+        if sesion['trabajo_realizado']:
+            result.append(f"Realizado: {sesion['trabajo_realizado']}")
+        if sesion['pendientes']:
+            result.append(f"PENDIENTES: {sesion['pendientes']}")
+        result.append("")
+
+    # --- Tickets abiertos ---
+    query_tickets = """
+        SELECT t.codigo, t.titulo, t.estado, t.prioridad, p.nombre as proyecto_nombre
+        FROM tickets t LEFT JOIN proyectos p ON t.proyecto_id = p.id
+        WHERE t.estado IN ('ABIERTO', 'EN_PROCESO')
+    """
+    params_tickets = []
+    if proyecto:
+        query_tickets += " AND p.nombre LIKE ?"
+        params_tickets.append(f"%{proyecto}%")
+    query_tickets += " ORDER BY CASE t.prioridad WHEN 'CRITICA' THEN 1 WHEN 'ALTA' THEN 2 WHEN 'MEDIA' THEN 3 ELSE 4 END, t.updated_at DESC LIMIT 10"
+    tickets = conn.execute(query_tickets, params_tickets).fetchall()
+
+    if tickets:
+        result.append(f"=== TICKETS ABIERTOS ({len(tickets)}) ===")
+        for t in tickets:
+            result.append(f"  [{t['codigo']}] ({t['prioridad']}) {t['titulo']} @{t['proyecto_nombre'] or '-'}")
+        result.append("")
+
+    # --- Notas recientes (ultimas 5) ---
+    query_notas = """
+        SELECT n.contenido, n.tipo, n.fecha, t.codigo as ticket_codigo, p.nombre as proyecto_nombre
+        FROM notas n
+        LEFT JOIN tickets t ON n.ticket_id = t.id
+        LEFT JOIN proyectos p ON n.proyecto_id = p.id
+    """
+    params_notas = []
+    if proyecto:
+        query_notas += " WHERE p.nombre LIKE ?"
+        params_notas.append(f"%{proyecto}%")
+    query_notas += " ORDER BY n.fecha DESC LIMIT 5"
+    notas = conn.execute(query_notas, params_notas).fetchall()
+
+    if notas:
+        result.append("=== NOTAS RECIENTES ===")
+        for n in notas:
+            ref = f" #{n['ticket_codigo']}" if n['ticket_codigo'] else ""
+            proj = f" @{n['proyecto_nombre']}" if n['proyecto_nombre'] else ""
+            result.append(f"  [{n['fecha']}] ({n['tipo']}){ref}{proj}")
+            result.append(f"    {n['contenido'][:150]}")
+        result.append("")
+
+    # --- Ultimas acciones (ultimas 5) ---
+    query_acciones = """
+        SELECT a.descripcion, a.tipo, a.fecha, a.ambiente, a.servidor,
+               t.codigo as ticket_codigo, p.nombre as proyecto_nombre
+        FROM acciones a
+        LEFT JOIN tickets t ON a.ticket_id = t.id
+        LEFT JOIN proyectos p ON a.proyecto_id = p.id
+    """
+    params_acciones = []
+    if proyecto:
+        query_acciones += " WHERE p.nombre LIKE ?"
+        params_acciones.append(f"%{proyecto}%")
+    query_acciones += " ORDER BY a.fecha DESC LIMIT 5"
+    acciones = conn.execute(query_acciones, params_acciones).fetchall()
+
+    if acciones:
+        result.append("=== ULTIMAS ACCIONES ===")
+        for a in acciones:
+            ref = f" #{a['ticket_codigo']}" if a['ticket_codigo'] else ""
+            amb = f" [{a['ambiente']}]" if a['ambiente'] else ""
+            result.append(f"  [{a['fecha']}] ({a['tipo']}){ref}{amb} {a['descripcion'][:100]}")
+        result.append("")
+
+    # --- Estadisticas ---
+    if proyecto:
+        pid_row = conn.execute("SELECT id FROM proyectos WHERE nombre LIKE ?", (f"%{proyecto}%",)).fetchone()
+        if pid_row:
+            pid = pid_row['id']
+            total = conn.execute("SELECT COUNT(*) FROM tickets WHERE proyecto_id=?", (pid,)).fetchone()[0]
+            abiertos = conn.execute("SELECT COUNT(*) FROM tickets WHERE proyecto_id=? AND estado IN ('ABIERTO','EN_PROCESO')", (pid,)).fetchone()[0]
+            total_notas = conn.execute("SELECT COUNT(*) FROM notas WHERE proyecto_id=?", (pid,)).fetchone()[0]
+            total_sesiones = conn.execute("SELECT COUNT(*) FROM sesiones WHERE proyecto_id=?", (pid,)).fetchone()[0]
+            result.append(f"=== STATS: {total} tickets ({abiertos} abiertos) | {total_notas} notas | {total_sesiones} sesiones ===")
+    else:
+        total_proy = conn.execute("SELECT COUNT(*) FROM proyectos").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+        abiertos = conn.execute("SELECT COUNT(*) FROM tickets WHERE estado IN ('ABIERTO','EN_PROCESO')").fetchone()[0]
+        result.append(f"=== STATS GLOBALES: {total_proy} proyectos | {total} tickets ({abiertos} abiertos) ===")
+
+    conn.close()
+
+    if not result:
+        return "Base de datos vacia. Es la primera sesion en este equipo."
+
     return "\n".join(result)
 
 
@@ -709,9 +958,7 @@ def ver_ultima_sesion(proyecto: str = "") -> str:
 
 @mcp.tool()
 def buscar_general(texto: str, limite: int = 15) -> str:
-    """Busqueda general en tickets, notas y acciones.
-
-    Busca el texto en todos los campos relevantes de todas las tablas.
+    """Busqueda full-text en tickets, notas y acciones. Busca en todos los campos relevantes.
 
     Args:
         texto: Texto a buscar
@@ -720,7 +967,6 @@ def buscar_general(texto: str, limite: int = 15) -> str:
     conn = get_db()
     results = []
 
-    # Buscar en tickets
     tickets = conn.execute("""
         SELECT codigo, titulo, estado, descripcion
         FROM tickets
@@ -730,18 +976,16 @@ def buscar_general(texto: str, limite: int = 15) -> str:
     """, (f"%{texto}%",) * 6 + (limite,)).fetchall()
 
     if tickets:
-        results.append("═══ TICKETS ═══")
+        results.append("=== TICKETS ===")
         for t in tickets:
             results.append(f"  [{t['codigo']}] ({t['estado']}) {t['titulo']}")
             if t['descripcion'] and texto.lower() in t['descripcion'].lower():
-                # Mostrar fragmento relevante
                 idx = t['descripcion'].lower().find(texto.lower())
                 start = max(0, idx - 50)
                 end = min(len(t['descripcion']), idx + len(texto) + 50)
                 results.append(f"    ...{t['descripcion'][start:end]}...")
         results.append("")
 
-    # Buscar en notas
     notas = conn.execute("""
         SELECT n.contenido, n.tipo, n.fecha, t.codigo as ticket_codigo
         FROM notas n
@@ -751,7 +995,7 @@ def buscar_general(texto: str, limite: int = 15) -> str:
     """, (f"%{texto}%", limite)).fetchall()
 
     if notas:
-        results.append("═══ NOTAS ═══")
+        results.append("=== NOTAS ===")
         for n in notas:
             ref = f" #{n['ticket_codigo']}" if n['ticket_codigo'] else ""
             results.append(f"  [{n['fecha']}] ({n['tipo']}){ref}")
@@ -761,7 +1005,6 @@ def buscar_general(texto: str, limite: int = 15) -> str:
             results.append(f"    ...{n['contenido'][start:end]}...")
         results.append("")
 
-    # Buscar en acciones
     acciones = conn.execute("""
         SELECT a.descripcion, a.tipo, a.fecha, a.comando, t.codigo as ticket_codigo
         FROM acciones a
@@ -771,7 +1014,7 @@ def buscar_general(texto: str, limite: int = 15) -> str:
     """, (f"%{texto}%",) * 3 + (limite,)).fetchall()
 
     if acciones:
-        results.append("═══ ACCIONES ═══")
+        results.append("=== ACCIONES ===")
         for a in acciones:
             ref = f" #{a['ticket_codigo']}" if a['ticket_codigo'] else ""
             results.append(f"  [{a['fecha']}] ({a['tipo']}){ref} {a['descripcion']}")
@@ -789,10 +1032,10 @@ def buscar_general(texto: str, limite: int = 15) -> str:
 
 @mcp.tool()
 def estadisticas(proyecto: str = "") -> str:
-    """Muestra estadisticas de la base de datos.
+    """Muestra estadisticas numericas de la base de datos.
 
     Args:
-        proyecto: Filtrar por proyecto (opcional)
+        proyecto: Filtrar por proyecto (opcional, muestra globales si no se indica)
     """
     conn = get_db()
 
@@ -824,7 +1067,7 @@ def estadisticas(proyecto: str = "") -> str:
 
     conn.close()
 
-    result = [f"═══ ESTADISTICAS {('- ' + proyecto) if proyecto else 'GLOBALES'} ═══"]
+    result = [f"=== ESTADISTICAS {('- ' + proyecto) if proyecto else 'GLOBALES'} ==="]
     for k, v in stats.items():
         result.append(f"  {k.replace('_', ' ').title()}: {v}")
 
